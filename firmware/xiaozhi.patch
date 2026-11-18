@@ -1,0 +1,1400 @@
+diff --git a/main/CMakeLists.txt b/main/CMakeLists.txt
+index 8c318f1..66bb891 100644
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@ -91,7 +91,13 @@ set(EMOTE_RESOLUTION "320_240")
+ 
+ # Select the board source directory from Kconfig
+ # Set default assets if the board uses partition table V2
+-if(CONFIG_BOARD_TYPE_BREAD_COMPACT_WIFI)
++if(CONFIG_BOARD_TYPE_AI_CHATBOT_S3)
++    set(BOARD_DIR "ai-chatbot-s3")
++    set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
++    set(BUILTIN_ICON_FONT font_material_symbols_20_4)
++    set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_64)
++    set(DEFAULT_ASSETS_EXTRA_FILES "${CMAKE_CURRENT_SOURCE_DIR}/boards/ai-chatbot-s3/assets")
++elseif(CONFIG_BOARD_TYPE_BREAD_COMPACT_WIFI)
+     set(BOARD_DIR "bread-compact-wifi")
+     set(BUILTIN_TEXT_FONT font_noto_sans_basic_14_1)
+     set(BUILTIN_ICON_FONT font_material_symbols_14_1)
+@@ -1421,6 +1427,8 @@ function(build_default_assets_bin)
+     # Add default assets extra files if defined
+     if(DEFAULT_ASSETS_EXTRA_FILES)
+         list(APPEND BUILD_ARGS "--extra_files" "${DEFAULT_ASSETS_EXTRA_FILES}")
++        file(GLOB DEFAULT_EXTRA_ASSET_FILES CONFIGURE_DEPENDS "${DEFAULT_ASSETS_EXTRA_FILES}/*")
++        list(APPEND DEFAULT_ASSETS_DEPENDENCIES ${DEFAULT_EXTRA_ASSET_FILES})
+     endif()
+ 
+     list(APPEND BUILD_ARGS "--esp_sr_model_path" "${ESP_SR_MODEL_PATH}")
+diff --git a/main/Kconfig.projbuild b/main/Kconfig.projbuild
+index 3917618..99f47ec 100644
+--- a/main/Kconfig.projbuild
++++ b/main/Kconfig.projbuild
+@@ -136,6 +136,9 @@ choice BOARD_TYPE
+         Select the physical board hardware implementation.
+         The OTA board type and firmware variant name are configured separately.
+ 
++    config BOARD_TYPE_AI_CHATBOT_S3
++        bool "AI Chatbot ESP32-S3 N16R8 ST7789"
++        depends on IDF_TARGET_ESP32S3
+     config BOARD_TYPE_ATK_DNESP32S3
+         bool "Alientek ATK-DNESP32S3 Development Board (正点原子)"
+         depends on IDF_TARGET_ESP32S3
+diff --git a/main/application.cc b/main/application.cc
+index e1f0719..cc37b6d 100644
+--- a/main/application.cc
++++ b/main/application.cc
+@@ -11,6 +11,9 @@
+ #include "system_info.h"
+ #include "text_glyph_payload.h"
+ #include "websocket_protocol.h"
++#if CONFIG_BOARD_TYPE_AI_CHATBOT_S3
++#include "boards/ai-chatbot-s3/reminder_client.h"
++#endif
+ 
+ #include <driver/gpio.h>
+ #include <esp_log.h>
+@@ -19,8 +22,10 @@
+ #include <algorithm>
+ #include <cstring>
+ #include <limits>
++#include <cmath>
+ 
+ #define TAG "Application"
++#include "boards/ai-chatbot-s3/continuous_application.inc"
+ 
+ Application::Application() : notify_player_(audio_service_) {
+     event_group_ = xEventGroupCreate();
+@@ -198,6 +203,8 @@ void Application::Run() {
+         auto bits = xEventGroupWaitBits(event_group_, ALL_EVENTS, pdTRUE, pdFALSE, portMAX_DELAY);
+ 
+         if (bits & MAIN_EVENT_ERROR) {
++            if (continuous_transport_) CancelContinuousConversation(true);
++            conversation_pending_ = false;
+             if (GetDeviceState() == kDeviceStateNotifying) {
+                 StopNotification();
+             }
+@@ -223,8 +230,12 @@ void Application::Run() {
+         }
+ 
+         if (bits & MAIN_EVENT_PLAYBACK_DRAINED) {
++            TryContinuousRearm();
+             if (audio_service_.IsPlaybackIdle()) {
+                 notify_player_.OnPlaybackDrained();
++                if (notification_waiting_for_drain_) {
++                    HandleNotificationFinished(notification_playback_id_, true);
++                }
+             }
+             // Deferred listening start (auto mode): the playback queue has
+             // drained, so it is now safe to enable voice processing.
+@@ -247,8 +258,21 @@ void Application::Run() {
+             HandleStopListeningEvent();
+         }
+ 
++        if (bits & MAIN_EVENT_SCHEDULE) {
++            std::unique_lock<std::mutex> lock(mutex_);
++            auto tasks = std::move(main_tasks_);
++            lock.unlock();
++            for (auto& task : tasks) {
++                task();
++            }
++        }
++
+         if (bits & MAIN_EVENT_SEND_AUDIO) {
+             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
++                if (continuous_transport_ || packet->capture_generation != 0) {
++                    HandleContinuousPacket(std::move(packet));
++                    continue;
++                }
+                 if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
+                     // Drop the remaining packets. Leaving them in the queue would
+                     // stall the Opus codec task (it waits for queue space), which in
+@@ -272,17 +296,17 @@ void Application::Run() {
+             }
+         }
+ 
+-        if (bits & MAIN_EVENT_SCHEDULE) {
+-            std::unique_lock<std::mutex> lock(mutex_);
+-            auto tasks = std::move(main_tasks_);
+-            lock.unlock();
+-            for (auto& task : tasks) {
+-                task();
+-            }
+-        }
+-
+         if (bits & MAIN_EVENT_CLOCK_TICK) {
++            if ((continuous_.aborting && esp_timer_get_time() >= abort_deadline_) ||
++                (continuous_.processing && processing_deadline_ != 0 && esp_timer_get_time() >= processing_deadline_)) {
++                ESP_LOGW(TAG, "Voice response stalled; closing stale turn");
++                CancelContinuousConversation(true);
++            }
++            TryContinuousRearm();
+             clock_ticks_++;
++#if CONFIG_BOARD_TYPE_AI_CHATBOT_S3
++            ReminderClient::GetInstance().Tick(IsReminderIdle());
++#endif
+             auto display = Board::GetInstance().GetDisplay();
+             display->UpdateStatusBar();
+ 
+@@ -301,6 +325,7 @@ void Application::Run() {
+ }
+ 
+ void Application::HandleNetworkConnectedEvent() {
++    network_connected_ = true;
+     ESP_LOGI(TAG, "Network connected");
+     auto state = GetDeviceState();
+ 
+@@ -328,6 +353,9 @@ void Application::HandleNetworkConnectedEvent() {
+ }
+ 
+ void Application::HandleNetworkDisconnectedEvent() {
++    network_connected_ = false;
++    if (continuous_transport_) CancelContinuousConversation(true);
++    conversation_pending_ = false;
+     // Close current conversation when network disconnected
+     auto state = GetDeviceState();
+     if (state == kDeviceStateNotifying) {
+@@ -577,6 +605,25 @@ void Application::InitializeProtocol() {
+     });
+ 
+     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
++        if (continuous_transport_) {
++            const auto generation = transport_generation_.load();
++            if (scheduled_audio_.fetch_add(1) >= MAX_DECODE_PACKETS_IN_QUEUE) {
++                --scheduled_audio_;
++                Schedule([this, generation]() {
++                    if (generation == transport_generation_) CancelContinuousConversation(true);
++                });
++                return;
++            }
++            auto pending = std::shared_ptr<AudioStreamPacket>(std::move(packet));
++            Schedule([this, generation, pending]() mutable {
++                --scheduled_audio_;
++                if (generation != transport_generation_ || !continuous_.active || !continuous_audio_open_) return;
++                processing_deadline_ = esp_timer_get_time() + 15000000;
++                if (!audio_service_.PushPacketToDecodeQueue(std::make_unique<AudioStreamPacket>(std::move(*pending))))
++                    CancelContinuousConversation(true);
++            });
++            return;
++        }
+         if (GetDeviceState() == kDeviceStateSpeaking) {
+             audio_service_.PushPacketToDecodeQueue(std::move(packet));
+         }
+@@ -594,7 +641,12 @@ void Application::InitializeProtocol() {
+ 
+     protocol_->OnAudioChannelClosed([this, &board]() {
+         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+-        Schedule([this]() {
++        const auto generation = transport_generation_.load();
++        Schedule([this, generation]() {
++            if (generation != transport_generation_) return;
++            if (continuous_transport_) CancelContinuousConversation(true);
++            conversation_pending_ = false;
++            if (GetDeviceState() == kDeviceStateNotifying) return;
+             auto display = Board::GetInstance().GetDisplay();
+             display->SetChatMessage("system", "");
+             SetDeviceState(kDeviceStateIdle);
+@@ -602,9 +654,21 @@ void Application::InitializeProtocol() {
+     });
+ 
+     protocol_->OnIncomingJson([this, display](const cJSON* root) {
++        if (continuous_transport_) {
++            const auto generation = transport_generation_.load();
++            auto encoded = cJSON_PrintUnformatted(root);
++            if (encoded) {
++                std::string json(encoded);
++                cJSON_free(encoded);
++                Schedule([this, generation, json = std::move(json)]() {
++                    if (generation == transport_generation_) HandleContinuousJson(json);
++                });
++            }
++            return;
++        }
+         // Parse JSON data
+         auto type = cJSON_GetObjectItem(root, "type");
+-        if (!cJSON_IsString(type)) {
++        if (!cJSON_IsString(type) || !type->valuestring) {
+             ESP_LOGW(TAG, "Incoming JSON message has no type");
+             return;
+         }
+@@ -653,6 +717,7 @@ void Application::InitializeProtocol() {
+                 });
+             } else if (strcmp(state->valuestring, "stop") == 0) {
+                 Schedule([this]() {
++                    conversation_pending_ = false;
+                     if (GetDeviceState() == kDeviceStateSpeaking) {
+                         if (listening_mode_ == kListeningModeManualStop) {
+                             SetDeviceState(kDeviceStateIdle);
+@@ -1029,6 +1094,13 @@ void Application::HandleStateChangedEvent() {
+     auto led = board.GetLed();
+     led->OnStateChanged();
+ 
++    if (continuous_transport_ && continuous_.active &&
++        (new_state == kDeviceStateListening || new_state == kDeviceStateSpeaking)) {
++        display->SetStatus(new_state == kDeviceStateSpeaking ? Lang::Strings::SPEAKING :
++                           (continuous_.processing ? "Dang xu ly..." : Lang::Strings::LISTENING));
++        display->SetEmotion("neutral");
++        return; // Capture and decoder lifecycles belong to the continuous FIFO, not delayed state events.
++    }
+     switch (new_state) {
+         case kDeviceStateUnknown:
+         case kDeviceStateIdle:
+@@ -1168,6 +1240,7 @@ void Application::StartListeningAudio() {
+         return;
+     }
+ 
++    conversation_pending_ = true;
+     // Send the start listening command
+     protocol_->SendStartListening(listening_mode_);
+     audio_service_.EnableVoiceProcessing(true);
+@@ -1191,11 +1264,25 @@ void Application::ConfigureWakeWordForListening() {
+ #endif
+ }
+ 
+-void Application::StartNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles) {
+-    if (GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy()) {
+-        ESP_LOGW(TAG, "Ignoring notify message while device is busy");
+-        return;
+-    }
++bool Application::IsReminderIdle() {
++    const auto pending = xEventGroupGetBits(event_group_);
++    return startup_completed_ && network_connected_ && GetDeviceState() == kDeviceStateIdle &&
++           !continuous_.active && !continuous_.aborting && !conversation_pending_ && !notify_player_.IsBusy() && audio_service_.IsPlaybackIdle() &&
++           !(pending & (MAIN_EVENT_START_LISTENING | MAIN_EVENT_TOGGLE_CHAT |
++                        MAIN_EVENT_WAKE_WORD_DETECTED | MAIN_EVENT_NETWORK_DISCONNECTED));
++}
++
++bool Application::PlayReminder(std::string url, std::string text,
++                               std::function<void(const std::string&)> finished) {
++    return StartNotification(std::move(url), {{0, std::move(text)}}, std::move(finished));
++}
++
++bool Application::StartNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles,
++                                    std::function<void(const std::string&)> finished) {
++    if (!IsReminderIdle()) return false;
++#if CONFIG_BOARD_TYPE_AI_CHATBOT_S3
++    if (!ReminderClient::IsAllowedMediaUrl(audio_url)) return false;
++#endif
+ 
+     auto& board = Board::GetInstance();
+     board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+@@ -1208,8 +1295,10 @@ void Application::StartNotification(std::string audio_url, std::vector<NotifySub
+ 
+     if (!SetDeviceState(kDeviceStateNotifying)) {
+         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+-        return;
++        return false;
+     }
++    notification_finished_ = std::move(finished);
++    notification_waiting_for_drain_ = false;
+ 
+     audio_service_.ResetDecoder();
+     uint32_t playback_id = ++notification_playback_id_;
+@@ -1233,11 +1322,15 @@ void Application::StartNotification(std::string audio_url, std::vector<NotifySub
+ 
+     if (!started) {
+         ESP_LOGE(TAG, "Failed to start notification playback");
+-        StopNotification();
++        StopNotification("failed");
+     }
++    return true;
+ }
+ 
+-void Application::StopNotification() {
++void Application::StopNotification(const std::string& status) {
++    notification_waiting_for_drain_ = false;
++    auto finished = std::move(notification_finished_);
++    notification_finished_ = {};
+     notify_player_.Stop();
+     audio_service_.ResetDecoder();
+     auto& board = Board::GetInstance();
+@@ -1246,15 +1339,20 @@ void Application::StopNotification() {
+     if (GetDeviceState() == kDeviceStateNotifying) {
+         SetDeviceState(kDeviceStateIdle);
+     }
++    if (finished) finished(status);
+ }
+ 
+ void Application::HandleNotificationFinished(uint32_t playback_id, bool success) {
+     if (GetDeviceState() != kDeviceStateNotifying || notification_playback_id_ != playback_id) {
+         return;
+     }
++    if (success && !audio_service_.IsPlaybackIdle()) {
++        notification_waiting_for_drain_ = true;
++        return;
++    }
+     ESP_LOGI(TAG, "Notification playback %lu %s", static_cast<unsigned long>(playback_id),
+              success ? "completed" : "failed");
+-    StopNotification();
++    StopNotification(success ? "played" : "failed");
+ }
+ 
+ void Application::Schedule(std::function<void()>&& callback) {
+diff --git a/main/application.h b/main/application.h
+index 1fa825e..ffa5ea3 100644
+--- a/main/application.h
++++ b/main/application.h
+@@ -20,6 +20,7 @@
+ #include "device_state.h"
+ #include "device_state_machine.h"
+ #include "notify/notify_player.h"
++#include "boards/ai-chatbot-s3/continuous_conversation.h"
+ 
+ // Main event bits
+ #define MAIN_EVENT_SCHEDULE             (1 << 0)
+@@ -107,6 +108,7 @@ public:
+      * Sends MAIN_EVENT_STOP_LISTENING to be handled in Run()
+      */
+     void StopListening();
++    void ToggleContinuousConversation();
+ 
+     void Reboot();
+     void WakeWordInvoke(const std::string& wake_word);
+@@ -117,6 +119,9 @@ public:
+     void SetAecMode(AecMode mode);
+     AecMode GetAecMode() const { return aec_mode_; }
+     void PlaySound(const std::string_view& sound);
++    bool PlayReminder(std::string url, std::string text,
++                      std::function<void(const std::string&)> finished);
++    bool IsReminderIdle();
+     AudioService& GetAudioService() { return audio_service_; }
+     
+     /**
+@@ -130,6 +135,21 @@ private:
+     Application();
+     ~Application();
+ 
++    ContinuousConversation continuous_;
++    std::atomic<bool> continuous_transport_{false};
++    std::atomic<uint32_t> transport_generation_{0};
++    std::atomic<int> scheduled_audio_{0};
++    uint32_t capture_generation_ = 0;
++    bool continuous_audio_open_ = false;
++    int64_t abort_deadline_ = 0;
++    int64_t processing_deadline_ = 0;
++    void OpenContinuousConversation();
++    void ArmContinuousCapture();
++    void CancelContinuousConversation(bool close_channel = false);
++    void HandleContinuousJson(const std::string& json);
++    void HandleContinuousPacket(std::unique_ptr<AudioStreamPacket> packet);
++    void TryContinuousRearm();
++
+     std::mutex mutex_;
+     std::deque<std::function<void()>> main_tasks_;
+     std::unique_ptr<Protocol> protocol_;
+@@ -144,6 +164,10 @@ private:
+     AudioService audio_service_;
+     NotifyPlayer notify_player_;
+     uint32_t notification_playback_id_ = 0;
++    std::function<void(const std::string&)> notification_finished_;
++    bool notification_waiting_for_drain_ = false;
++    bool conversation_pending_ = false;
++    bool network_connected_ = false;
+     std::unique_ptr<Ota> ota_;
+ 
+     std::function<void(const std::string&)> mcp_broadcast_callback_;
+@@ -175,8 +199,9 @@ private:
+     void ConfigureWakeWordForListening();
+     void ShowStartupWakeWordHint();
+     void HideStartupWakeWordHint();
+-    void StartNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles);
+-    void StopNotification();
++    bool StartNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles,
++                           std::function<void(const std::string&)> finished = {});
++    void StopNotification(const std::string& status = "cancelled");
+     void HandleNotificationFinished(uint32_t playback_id, bool success);
+ 
+     // Activation task (runs in background)
+diff --git a/main/audio/audio_codec.h b/main/audio/audio_codec.h
+index a267dbb..f72e893 100644
+--- a/main/audio/audio_codec.h
++++ b/main/audio/audio_codec.h
+@@ -35,6 +35,8 @@ public:
+     virtual void EnableOutput(bool enable);
+ 
+     virtual void OutputData(std::vector<int16_t>& data);
++    virtual void DrainOutput() {}
++    virtual void ResetOutput() {}
+     virtual bool InputData(std::vector<int16_t>& data);
+     virtual void Start();
+ 
+diff --git a/main/audio/audio_engine.h b/main/audio/audio_engine.h
+index 610e2fa..1552c5b 100644
+--- a/main/audio/audio_engine.h
++++ b/main/audio/audio_engine.h
+@@ -21,6 +21,10 @@ public:
+     virtual void EnableWakeWordDetection(bool enable) = 0;
+     virtual void EnableVoiceProcessing(bool enable) = 0;
+     virtual void EnableDeviceAec(bool enable) = 0;
++    virtual bool StartContinuousCapture(uint32_t generation) { return false; }
++    virtual void CancelContinuousCapture() {}
++    // Events: 0 start, 1 PCM, 2 stop, 3 error.
++    virtual void OnCapture(std::function<void(uint32_t, int, std::vector<int16_t>&&)> callback) {}
+ 
+     virtual bool HasWakeWord() const = 0;
+     virtual bool IsWakeWordDetectionEnabled() const = 0;
+diff --git a/main/audio/audio_service.cc b/main/audio/audio_service.cc
+index 358a094..c87186c 100644
+--- a/main/audio/audio_service.cc
++++ b/main/audio/audio_service.cc
+@@ -87,6 +87,9 @@ void AudioService::Initialize(AudioCodec* codec) {
+     audio_engine_->OnOutput([this](std::vector<int16_t>&& data) {
+         PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
+     });
++    audio_engine_->OnCapture([this](uint32_t generation, int event, std::vector<int16_t>&& pcm) {
++        PushCaptureTask(generation, event, std::move(pcm));
++    });
+     audio_engine_->OnVadStateChange([this](bool speaking) {
+         voice_detected_ = speaking;
+         if (callbacks_.on_vad_change) {
+@@ -274,6 +277,12 @@ void AudioService::AudioInputTask() {
+         }
+ 
+         if (audio_input_need_warmup_.exchange(false)) {
++#if CONFIG_BOARD_TYPE_AI_CHATBOT_S3
++            // Half-duplex pauses Feed(), not RX DMA. Restart RX in its owning task
++            // so queued speaker-tail samples cannot become the next utterance.
++            if (codec_->input_enabled()) codec_->EnableInput(false);
++            codec_->EnableInput(true);
++#endif
+             vTaskDelay(pdMS_TO_TICKS(120));
+             continue;
+         }
+@@ -334,25 +343,38 @@ void AudioService::AudioOutputTask() {
+ 
+         auto task = std::move(audio_playback_queue_.front());
+         audio_playback_queue_.pop_front();
++        const uint32_t generation = playback_generation_;
+         output_in_flight_ = true;
+         audio_queue_cv_.notify_all();
+         lock.unlock();
+ 
+-        if (!codec_->output_enabled()) {
+-            esp_timer_stop(audio_power_timer_);
+-            esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
+-            codec_->EnableOutput(true);
+-        }
++        std::unique_lock<std::mutex> output_lock(audio_output_mutex_);
++        lock.lock();
++        const bool current = generation == playback_generation_ && !service_stopped_.load();
++        lock.unlock();
++        if (current) {
++            if (!codec_->output_enabled()) {
++                esp_timer_stop(audio_power_timer_);
++                esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
++                codec_->EnableOutput(true);
++            }
+ 
+-        if (task.playback_id != 0 && callbacks_.on_playback_progress) {
+-            callbacks_.on_playback_progress(task.playback_id, task.media_position_ms);
++            if (task.playback_id != 0 && callbacks_.on_playback_progress) {
++                callbacks_.on_playback_progress(task.playback_id, task.media_position_ms);
++            }
++            codec_->OutputData(task.pcm);
++            last_output_time_ = std::chrono::steady_clock::now();
++            debug_statistics_.playback_count++;
++            lock.lock();
++            audio_queue_cv_.wait(lock, [this]() {
++                return (!decode_in_flight_ && audio_decode_queue_.empty()) ||
++                       !audio_playback_queue_.empty() || service_stopped_.load();
++            });
++            const bool drain_hardware = audio_decode_queue_.empty() && audio_playback_queue_.empty();
++            lock.unlock();
++            if (drain_hardware) codec_->DrainOutput();
+         }
+-
+-        codec_->OutputData(task.pcm);
+-
+-        /* Update the last output time */
+-        last_output_time_ = std::chrono::steady_clock::now();
+-        debug_statistics_.playback_count++;
++        output_lock.unlock();
+ 
+         bool notify_drained = false;
+         lock.lock();
+@@ -473,6 +495,23 @@ void AudioService::OpusCodecTask() {
+             packet->frame_duration = OPUS_FRAME_DURATION_MS;
+             packet->sample_rate = 16000;
+             packet->timestamp = task.timestamp;
++            packet->capture_generation = task.capture_generation;
++            packet->capture_event = task.capture_event;
++
++            if (task.capture_generation != 0 && task.capture_event != CaptureEvent::Audio) {
++                bool wake = false;
++                {
++                    std::lock_guard<std::mutex> guard(audio_queue_mutex_);
++                    if (task.capture_generation == capture_generation_ && !capture_failed_) {
++                        if (!audio_send_queue_.push_back(std::move(packet)))
++                            AbortContinuousCaptureLocked(task.capture_generation);
++                        wake = true;
++                    }
++                }
++                if (wake && callbacks_.on_send_queue_available) callbacks_.on_send_queue_available();
++                lock.lock();
++                continue;
++            }
+ 
+             if (opus_encoder_ != nullptr && task.pcm.size() == encoder_frame_size_) {
+                 packet->payload.resize(encoder_outbuf_size_);
+@@ -494,10 +533,19 @@ void AudioService::OpusCodecTask() {
+                             std::lock_guard<std::mutex> lock2(audio_queue_mutex_);
+                             /* Never let a full send queue stall encoding: stale realtime
+                              * audio is useless to the server, so drop the oldest packet. */
+-                            if (audio_send_queue_.size() >= MAX_SEND_PACKETS_IN_QUEUE) {
++                            if (task.capture_generation != 0) {
++                                if (task.capture_generation != capture_generation_ || capture_failed_) {
++                                    packet.reset();
++                                } else if (audio_send_queue_.size() >= MAX_SEND_PACKETS_IN_QUEUE) {
++                                    AbortContinuousCaptureLocked(task.capture_generation);
++                                    packet.reset();
++                                }
++                            } else if (capture_generation_ != 0) {
++                                packet.reset();
++                            } else if (audio_send_queue_.size() >= MAX_SEND_PACKETS_IN_QUEUE) {
+                                 audio_send_queue_.pop_front();
+                             }
+-                            audio_send_queue_.push_back(std::move(packet));
++                            if (packet) audio_send_queue_.push_back(std::move(packet));
+                         }
+                         if (callbacks_.on_send_queue_available) {
+                             callbacks_.on_send_queue_available();
+@@ -515,12 +563,22 @@ void AudioService::OpusCodecTask() {
+                     debug_statistics_.encode_count++;
+                 } else {
+                     ESP_LOGE(TAG, "Failed to encode audio, error code: %d", ret);
++                    if (task.capture_generation != 0) {
++                        { std::lock_guard<std::mutex> guard(audio_queue_mutex_);
++                          AbortContinuousCaptureLocked(task.capture_generation); }
++                        if (callbacks_.on_send_queue_available) callbacks_.on_send_queue_available();
++                    }
+                 }
+             } else {
+                 ESP_LOGE(TAG,
+                          "Failed to encode audio: encoder not configured or invalid frame size "
+                          "(got %u, expected %u)",
+                          task.pcm.size(), encoder_frame_size_);
++                if (task.capture_generation != 0) {
++                    { std::lock_guard<std::mutex> guard(audio_queue_mutex_);
++                      AbortContinuousCaptureLocked(task.capture_generation); }
++                    if (callbacks_.on_send_queue_available) callbacks_.on_send_queue_available();
++                }
+             }
+             lock.lock();
+         }
+@@ -575,6 +633,7 @@ void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t
+     {
+         /* Push the task to the encode queue */
+         std::unique_lock<std::mutex> lock(audio_queue_mutex_);
++        if (capture_generation_ != 0 && type == kAudioTaskTypeEncodeToSendQueue) return;
+ 
+         /* If the task is to send queue, we need to set the timestamp */
+         if (type == kAudioTaskTypeEncodeToSendQueue && !timestamp_queue_.empty()) {
+@@ -606,6 +665,41 @@ void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t
+     }
+ }
+ 
++void AudioService::AbortContinuousCaptureLocked(uint32_t generation) {
++    if (generation == 0 || generation != capture_generation_ || capture_failed_) return;
++    capture_failed_ = true;
++    audio_encode_queue_.clear();
++    audio_send_queue_.clear();
++    auto error = std::make_unique<AudioStreamPacket>();
++    error->capture_generation = generation;
++    error->capture_event = CaptureEvent::Error;
++    audio_send_queue_.push_back(std::move(error));
++    audio_queue_cv_.notify_all();
++}
++
++void AudioService::PushCaptureTask(uint32_t generation, int event, std::vector<int16_t>&& pcm) {
++    bool wake = false;
++    {
++        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
++        if (generation == 0 || generation != capture_generation_ || capture_failed_) return;
++        if (event < 0 || event > 3 || event == 3 ||
++            audio_encode_queue_.size() >= MAX_CONTINUOUS_ENCODE_TASKS) {
++            AbortContinuousCaptureLocked(generation);
++            wake = true;
++        } else {
++            AudioTask task;
++            task.type = kAudioTaskTypeEncodeToSendQueue;
++            task.capture_generation = generation;
++            task.capture_event = event == 0 ? CaptureEvent::Start :
++                                 event == 1 ? CaptureEvent::Audio : CaptureEvent::Stop;
++            task.pcm = std::move(pcm);
++            audio_encode_queue_.push_back(std::move(task));
++            audio_queue_cv_.notify_all();
++        }
++    }
++    if (wake && callbacks_.on_send_queue_available) callbacks_.on_send_queue_available();
++}
++
+ bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait) {
+     std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+     const uint32_t generation = playback_generation_;
+@@ -710,6 +804,41 @@ void AudioService::ReleaseWakeWordResources() {
+ #endif
+ }
+ 
++bool AudioService::StartContinuousCapture(uint32_t generation) {
++    if (generation == 0 || service_stopped_.load() || opus_encoder_ == nullptr ||
++        encoder_frame_size_ != 960 || !InitializeAudioEngine()) return false;
++    CancelContinuousCapture();
++    {
++        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
++        capture_generation_ = generation;
++        capture_failed_ = false;
++    }
++    if (!audio_engine_->StartContinuousCapture(generation)) {
++        CancelContinuousCapture();
++        return false;
++    }
++    audio_input_need_warmup_ = true;
++    {
++        std::lock_guard<std::mutex> lock(input_resampler_mutex_);
++        if (input_resampler_ != nullptr) esp_ae_rate_cvt_reset(input_resampler_);
++    }
++    audio_engine_->EnableVoiceProcessing(true);
++    xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_PROCESSOR_RUNNING);
++    return true;
++}
++
++void AudioService::CancelContinuousCapture() {
++    {
++        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
++        capture_generation_ = 0;
++        capture_failed_ = false;
++        audio_encode_queue_.clear();
++        audio_send_queue_.clear();
++        audio_queue_cv_.notify_all();
++    }
++    if (audio_engine_initialized_) audio_engine_->CancelContinuousCapture();
++}
++
+ void AudioService::EnableVoiceProcessing(bool enable) {
+     ESP_LOGD(TAG, "%s voice processing", enable ? "Enabling" : "Disabling");
+ 
+@@ -728,6 +857,7 @@ void AudioService::EnableVoiceProcessing(bool enable) {
+         audio_engine_->EnableVoiceProcessing(true);
+         xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_PROCESSOR_RUNNING);
+     } else {
++        CancelContinuousCapture();
+         if (audio_engine_initialized_) {
+             audio_engine_->EnableVoiceProcessing(false);
+         }
+@@ -800,6 +930,7 @@ bool AudioService::IsPlaybackIdle() {
+ }
+ 
+ void AudioService::ResetDecoder() {
++    std::unique_lock<std::mutex> output_lock(audio_output_mutex_);
+     bool notify_drained = false;
+     {
+         std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+@@ -809,7 +940,9 @@ void AudioService::ResetDecoder() {
+             esp_opus_dec_reset(opus_decoder_);
+         }
+         decoder_lock.unlock();
++        codec_->ResetOutput();
+         timestamp_queue_.clear();
++        output_lock.unlock();
+         audio_decode_queue_.clear();
+         audio_playback_queue_.clear();
+         audio_testing_queue_.clear();
+diff --git a/main/audio/audio_service.h b/main/audio/audio_service.h
+index b79d033..cc49815 100644
+--- a/main/audio/audio_service.h
++++ b/main/audio/audio_service.h
+@@ -39,6 +39,7 @@
+ 
+ #define OPUS_FRAME_DURATION_MS 60
+ #define MAX_ENCODE_TASKS_IN_QUEUE 2
++#define MAX_CONTINUOUS_ENCODE_TASKS 16
+ #define MAX_PLAYBACK_TASKS_IN_QUEUE 2
+ #define MAX_DECODE_PACKETS_IN_QUEUE (1200 / OPUS_FRAME_DURATION_MS)
+ #define MAX_SEND_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
+@@ -98,6 +99,8 @@ enum AudioTaskType {
+ struct AudioTask {
+     AudioTaskType type;
+     std::vector<int16_t> pcm;
++    uint32_t capture_generation = 0;
++    CaptureEvent capture_event = CaptureEvent::Audio;
+     uint32_t timestamp = 0;
+     uint32_t playback_id = 0;
+     uint32_t media_position_ms = 0;
+@@ -137,6 +140,8 @@ public:
+     void EnableWakeWordDetection(bool enable);
+     void ReleaseWakeWordResources();
+     void EnableVoiceProcessing(bool enable);
++    bool StartContinuousCapture(uint32_t generation);
++    void CancelContinuousCapture();
+     void EnableAudioTesting(bool enable);
+     void EnableDeviceAec(bool enable);
+ 
+@@ -180,6 +185,7 @@ private:
+     TaskHandle_t audio_output_task_handle_ = nullptr;
+     TaskHandle_t opus_codec_task_handle_ = nullptr;
+     std::mutex audio_queue_mutex_;
++    std::mutex audio_output_mutex_; // Lock before audio_queue_mutex_ at the hardware boundary.
+     std::condition_variable audio_queue_cv_;
+     // Testing records up to AUDIO_TESTING_MAX_DURATION_MS, then swaps into the
+     // decode queue. Both queues must share this capacity so swap() is valid.
+@@ -189,7 +195,9 @@ private:
+     FixedQueue<std::unique_ptr<AudioStreamPacket>, MAX_SEND_PACKETS_IN_QUEUE> audio_send_queue_;
+     FixedQueue<std::unique_ptr<AudioStreamPacket>, kAudioTestingPacketCapacity>
+         audio_testing_queue_;
+-    FixedQueue<AudioTask, MAX_ENCODE_TASKS_IN_QUEUE> audio_encode_queue_;
++    FixedQueue<AudioTask, MAX_CONTINUOUS_ENCODE_TASKS> audio_encode_queue_;
++    uint32_t capture_generation_ = 0; // protected by audio_queue_mutex_
++    bool capture_failed_ = false;
+     FixedQueue<AudioTask, MAX_PLAYBACK_TASKS_IN_QUEUE> audio_playback_queue_;
+     bool decode_in_flight_ = false;
+     bool output_in_flight_ = false;
+@@ -216,6 +224,8 @@ private:
+     void AudioOutputTask();
+     void OpusCodecTask();
+     void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm);
++    void PushCaptureTask(uint32_t generation, int event, std::vector<int16_t>&& pcm);
++    void AbortContinuousCaptureLocked(uint32_t generation);
+     bool InitializeAudioEngine();
+     void SetDecodeSampleRate(int sample_rate, int frame_duration);
+     void CheckAndUpdateAudioPowerState();
+diff --git a/main/audio/codecs/no_audio_codec.cc b/main/audio/codecs/no_audio_codec.cc
+index 5387ceb..469c90d 100644
+--- a/main/audio/codecs/no_audio_codec.cc
++++ b/main/audio/codecs/no_audio_codec.cc
+@@ -216,7 +216,7 @@ NoAudioCodecSimplex::NoAudioCodecSimplex(int input_sample_rate, int output_sampl
+ }
+ 
+ int NoAudioCodec::Write(const int16_t* data, int samples) {
+-    std::lock_guard<std::mutex> lock(data_if_mutex_);
++    std::unique_lock<std::mutex> lock(data_if_mutex_);
+     std::vector<int32_t> buffer(samples);
+ 
+     // output_volume_: 0-100
+@@ -233,8 +233,16 @@ int NoAudioCodec::Write(const int16_t* data, int samples) {
+         }
+     }
+ 
+-    size_t bytes_written;
+-    ESP_ERROR_CHECK(i2s_channel_write(tx_handle_, buffer.data(), samples * sizeof(int32_t), &bytes_written, portMAX_DELAY));
++    size_t bytes_written = 0;
++    // Bound each DMA wait so BOOT can acquire the output barrier even if TX stalls.
++    const auto result = i2s_channel_write(tx_handle_, buffer.data(), samples * sizeof(int32_t),
++                                          &bytes_written, 100);
++    lock.unlock();
++    if (result != ESP_OK || bytes_written != samples * sizeof(int32_t)) {
++        ESP_LOGW(TAG, "I2S output incomplete; resetting TX");
++        ResetOutput();
++        return 0;
++    }
+     return bytes_written / sizeof(int32_t);
+ }
+ 
+diff --git a/main/audio/engines/afe_audio_engine.cc b/main/audio/engines/afe_audio_engine.cc
+index e245876..e1a3d62 100644
+--- a/main/audio/engines/afe_audio_engine.cc
++++ b/main/audio/engines/afe_audio_engine.cc
+@@ -137,9 +137,13 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms,
+     afe_config->vad_init = kUseAfeForVoiceProcessing;
+     afe_config->vad_mode = VAD_MODE_0;
+     afe_config->vad_min_noise_ms = 100;
++#if CONFIG_BOARD_TYPE_AI_CHATBOT_S3
++    afe_config->vad_model_name = nullptr;
++#else
+     if (vad_model_name != nullptr) {
+         afe_config->vad_model_name = vad_model_name;
+     }
++#endif
+     afe_config->wakenet_init = wake_detector_ == WakeDetector::kWakeNet;
+     afe_config->wakenet_model_name = nullptr;
+     afe_config->wakenet_model_name_2 = nullptr;
+@@ -307,6 +311,22 @@ void AfeAudioEngine::EnableVoiceProcessing(bool enable) {
+     UpdateActiveState();
+ }
+ 
++bool AfeAudioEngine::StartContinuousCapture(uint32_t generation) {
++#if CONFIG_BOARD_TYPE_AI_CHATBOT_S3
++    if (!generation || !kUseAfeForVoiceProcessing || !afe_data_ || !processing_task_ || !capture_callback_) return false;
++    capture_generation_.store(generation);
++    return true;
++#else
++    return false;
++#endif
++}
++
++void AfeAudioEngine::CancelContinuousCapture() { capture_generation_.store(0); }
++
++void AfeAudioEngine::OnCapture(std::function<void(uint32_t, int, std::vector<int16_t>&&)> callback) {
++    capture_callback_ = std::move(callback);
++}
++
+ void AfeAudioEngine::EnableDeviceAec(bool enable) {
+     device_aec_enabled_.store(enable);
+     if (enable && (codec_ == nullptr || !codec_->input_reference())) {
+@@ -426,6 +446,7 @@ void AfeAudioEngine::ProcessingTask() {
+             ApplyAfeControls();
+         }
+         const uint32_t generation = control_generation_.load();
++        const uint32_t capture_generation = capture_generation_.load();
+         auto* result = afe_iface_->fetch_with_delay(afe_data_, portMAX_DELAY);
+         if (generation != control_generation_.load() ||
+             (xEventGroupGetBits(event_group_) & kAfeActive) == 0) {
+@@ -446,7 +467,8 @@ void AfeAudioEngine::ProcessingTask() {
+             HandleWakeWordResult(result);
+         }
+         if (kUseAfeForVoiceProcessing && (bits & kVoiceProcessingEnabled)) {
+-            HandleVoiceResult(result);
++            if (capture_generation == capture_generation_.load())
++                HandleVoiceResult(result, capture_generation);
+         }
+     }
+ }
+@@ -480,7 +502,53 @@ void AfeAudioEngine::HandleWakeWordResult(const afe_fetch_result_t* result) {
+     }
+ }
+ 
+-void AfeAudioEngine::HandleVoiceResult(const afe_fetch_result_t* result) {
++void AfeAudioEngine::HandleVoiceResult(const afe_fetch_result_t* result, uint32_t capture_generation) {
++#if CONFIG_BOARD_TYPE_AI_CHATBOT_S3
++    if (capture_generation != 0) {
++        if (processed_capture_generation_ != capture_generation) {
++            processed_capture_generation_ = capture_generation;
++            continuous_vad_.Reset();
++            capture_history_.clear();
++            capture_pcm_.clear();
++            capture_seen_data_ = false;
++        }
++        const size_t samples = result->data_size / sizeof(int16_t);
++        if (!capture_seen_data_ && result->vad_cache && result->vad_cache_size > 0) {
++            const size_t n = result->vad_cache_size / sizeof(int16_t);
++            const size_t keep = std::min(n, size_t(4800));
++            capture_history_.insert(capture_history_.end(), result->vad_cache + n - keep,
++                                    result->vad_cache + n);
++            continuous_vad_.Push(false, keep);
++        }
++        capture_seen_data_ = true;
++        const auto decision = continuous_vad_.Push(result->vad_state == VAD_SPEECH, samples);
++        if (decision.event == ContinuousVad::Event::None || decision.event == ContinuousVad::Event::Start) {
++            capture_history_.insert(capture_history_.end(), result->data, result->data + samples);
++            if (capture_history_.size() > 4800)
++                capture_history_.erase(capture_history_.begin(), capture_history_.end() - 4800);
++        }
++        if (decision.event == ContinuousVad::Event::Start) {
++            capture_callback_(capture_generation, 0, {});
++            capture_pcm_.swap(capture_history_);
++        } else if (decision.event == ContinuousVad::Event::Audio || decision.event == ContinuousVad::Event::Stop) {
++            capture_pcm_.insert(capture_pcm_.end(), result->data, result->data + decision.samples);
++        }
++        while (capture_pcm_.size() >= static_cast<size_t>(frame_samples_)) {
++            std::vector<int16_t> frame(capture_pcm_.begin(), capture_pcm_.begin() + frame_samples_);
++            capture_pcm_.erase(capture_pcm_.begin(), capture_pcm_.begin() + frame_samples_);
++            capture_callback_(capture_generation, 1, std::move(frame));
++        }
++        if (decision.event == ContinuousVad::Event::Stop) {
++            if (!capture_pcm_.empty()) {
++                capture_pcm_.resize(frame_samples_, 0);
++                capture_callback_(capture_generation, 1, std::move(capture_pcm_));
++                capture_pcm_.clear();
++            }
++            capture_callback_(capture_generation, 2, {});
++        }
++        return;
++    }
++#endif
+     if (output_reset_pending_.exchange(false)) {
+         output_buffer_.clear();
+     }
+diff --git a/main/audio/engines/afe_audio_engine.h b/main/audio/engines/afe_audio_engine.h
+index ad262b6..d3b9261 100644
+--- a/main/audio/engines/afe_audio_engine.h
++++ b/main/audio/engines/afe_audio_engine.h
+@@ -17,6 +17,9 @@
+ 
+ #include "audio_engine.h"
+ #include "wake_words/wake_word_audio_cache.h"
++#if CONFIG_BOARD_TYPE_AI_CHATBOT_S3
++#include "boards/ai-chatbot-s3/continuous_vad.h"
++#endif
+ 
+ class CustomWakeWord;
+ 
+@@ -31,6 +34,9 @@ public:
+     void EnableWakeWordDetection(bool enable) override;
+     void EnableVoiceProcessing(bool enable) override;
+     void EnableDeviceAec(bool enable) override;
++    bool StartContinuousCapture(uint32_t generation) override;
++    void CancelContinuousCapture() override;
++    void OnCapture(std::function<void(uint32_t, int, std::vector<int16_t>&&)> callback) override;
+ 
+     bool HasWakeWord() const override;
+     bool IsWakeWordDetectionEnabled() const override;
+@@ -80,6 +86,15 @@ private:
+     // Incremented whenever an active AFE session is invalidated. ProcessingTask
+     // uses it to reject a fetch result produced before a disable/re-enable cycle.
+     std::atomic<uint32_t> control_generation_{0};
++    std::atomic<uint32_t> capture_generation_{0};
++    std::function<void(uint32_t, int, std::vector<int16_t>&&)> capture_callback_;
++#if CONFIG_BOARD_TYPE_AI_CHATBOT_S3
++    ContinuousVad continuous_vad_;
++    uint32_t processed_capture_generation_ = 0;
++    bool capture_seen_data_ = false;
++    std::vector<int16_t> capture_history_;
++    std::vector<int16_t> capture_pcm_;
++#endif
+     WakeDetector wake_detector_ = WakeDetector::kNone;
+ 
+     std::unique_ptr<CustomWakeWord> custom_wake_word_;
+@@ -108,7 +123,7 @@ private:
+     void ApplyPendingReset();
+     void OutputRawAudio(const std::vector<int16_t>& data);
+     void HandleWakeWordResult(const afe_fetch_result_t* result);
+-    void HandleVoiceResult(const afe_fetch_result_t* result);
++    void HandleVoiceResult(const afe_fetch_result_t* result, uint32_t capture_generation);
+ };
+ 
+ #endif
+diff --git a/main/boards/common/wifi_board.cc b/main/boards/common/wifi_board.cc
+index 5b3721d..564c590 100644
+--- a/main/boards/common/wifi_board.cc
++++ b/main/boards/common/wifi_board.cc
+@@ -94,6 +94,17 @@ void WifiBoard::StartNetwork() {
+     });
+ 
+     // Try to connect or enter config mode
++    bool force_config = false;
++    {
++        Settings settings("wifi", true);
++        force_config = settings.GetBool("force_config");
++        if (force_config) settings.SetBool("force_config", false);
++    }
++    if (force_config) {
++        ESP_LOGI(TAG, "Entering requested WiFi config mode before station startup");
++        StartWifiConfigMode();
++        return;
++    }
+     TryWifiConnect();
+ }
+ 
+diff --git a/main/notify/notify_player.cc b/main/notify/notify_player.cc
+index 312bc96..2947d19 100644
+--- a/main/notify/notify_player.cc
++++ b/main/notify/notify_player.cc
+@@ -1,4 +1,7 @@
+ #include "notify_player.h"
++#if CONFIG_BOARD_TYPE_AI_CHATBOT_S3
++#include "boards/ai-chatbot-s3/device_token.h"
++#endif
+ 
+ #include <algorithm>
+ #include <array>
+@@ -182,6 +185,11 @@ void NotifyPlayer::WorkerTask() {
+ 
+     bool success = false;
+     auto http = Board::GetInstance().GetNetwork()->CreateHttp(0);
++#if CONFIG_BOARD_TYPE_AI_CHATBOT_S3
++    auto token = DeviceToken::Get();
++    if (token.empty()) http.reset();
++    if (http) http->SetHeader("Authorization", "Bearer " + token);
++#endif
+     if (http) {
+         http->SetTimeout(kHttpTimeoutMs);
+         http->SetHeader("Accept", "audio/ogg, application/ogg");
+diff --git a/main/ota.cc b/main/ota.cc
+index 124d333..740f6ef 100644
+--- a/main/ota.cc
++++ b/main/ota.cc
+@@ -1,4 +1,8 @@
+ #include "ota.h"
++#if CONFIG_BOARD_TYPE_AI_CHATBOT_S3
++#include "boards/ai-chatbot-s3/server_url.h"
++#include "boards/ai-chatbot-s3/device_token.h"
++#endif
+ #include "system_info.h"
+ #include "settings.h"
+ #include "assets/lang_config.h"
+@@ -54,12 +58,16 @@ Ota::~Ota() {
+ }
+ 
+ std::string Ota::GetCheckVersionUrl() {
++#if CONFIG_BOARD_TYPE_AI_CHATBOT_S3
++    return ServerUrl::GetCheckVersionUrl();
++#else
+     Settings settings("wifi", false);
+     std::string url = settings.GetString("ota_url");
+     if (url.empty()) {
+         url = CONFIG_OTA_URL;
+     }
+     return url;
++#endif
+ }
+ 
+ std::unique_ptr<Http> Ota::SetupHttp() {
+@@ -67,6 +75,11 @@ std::unique_ptr<Http> Ota::SetupHttp() {
+     auto network = board.GetNetwork();
+     auto http = network->CreateHttp(0);
+     auto user_agent = SystemInfo::GetUserAgent();
++#if CONFIG_BOARD_TYPE_AI_CHATBOT_S3
++    auto token = DeviceToken::Get();
++    if (token.empty()) return nullptr;
++    http->SetHeader("Authorization", "Bearer " + token);
++#endif
+     http->SetHeader("Activation-Version", has_serial_number_ ? "2" : "1");
+     http->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
+     http->SetHeader("Client-Id", board.GetUuid());
+@@ -99,6 +112,7 @@ NetworkResult<> Ota::CheckVersion() {
+     }
+ 
+     auto http = SetupHttp();
++    if (!http) return std::unexpected(NetworkError::InvalidArgument());
+ 
+     std::string data = board.GetSystemInfoJson();
+     std::string method = data.length() > 0 ? "POST" : "GET";
+@@ -292,6 +306,14 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
+ 
+     auto network = Board::GetInstance().GetNetwork();
+     auto http = network->CreateHttp(0);
++    if (!http) return false;
++#if CONFIG_BOARD_TYPE_AI_CHATBOT_S3
++    if (!ServerUrl::IsAllowedFirmwareUrl(firmware_url)) return false;
++    auto token = DeviceToken::Get();
++    if (token.empty()) return false;
++    http->SetHeader("Authorization", "Bearer " + token);
++    http->SetHeader("Device-Id", SystemInfo::GetMacAddress());
++#endif
+     if (auto opened = http->Open("GET", firmware_url); !opened) {
+         ESP_LOGE(TAG, "Failed to open HTTP connection: %s", opened.error().ToString().c_str());
+         return false;
+@@ -515,6 +537,7 @@ esp_err_t Ota::Activate() {
+     }
+ 
+     auto http = SetupHttp();
++    if (!http) return ESP_FAIL;
+ 
+     std::string data = GetActivationPayload();
+     http->SetContent(std::move(data));
+diff --git a/main/protocols/protocol.cc b/main/protocols/protocol.cc
+index ac591b5..e050d30 100644
+--- a/main/protocols/protocol.cc
++++ b/main/protocols/protocol.cc
+@@ -99,6 +99,14 @@ void Protocol::SendStopListening() {
+     SendText(message);
+ }
+ 
++bool Protocol::SendContinuous(const char* type, const char* state, uint64_t epoch, uint64_t utterance) {
++    std::string message = "{\"type\":\"" + std::string(type) + "\",\"conversation_epoch\":" + std::to_string(epoch);
++    if (utterance) message += ",\"utterance_id\":" + std::to_string(utterance);
++    if (state) message += ",\"state\":\"" + std::string(state) + "\"";
++    if (state && std::string(state) == "start") message += ",\"mode\":\"auto\",\"session_mode\":\"continuous\"";
++    return SendText(message + "}");
++}
++
+ void Protocol::SendMcpMessage(const std::string& payload) {
+     std::string message =
+         "{\"session_id\":\"" + session_id_ + "\",\"type\":\"mcp\",\"payload\":" + payload + "}";
+diff --git a/main/protocols/protocol.h b/main/protocols/protocol.h
+index cfa0dd2..2466cb5 100644
+--- a/main/protocols/protocol.h
++++ b/main/protocols/protocol.h
+@@ -7,12 +7,16 @@
+ #include <string>
+ #include <vector>
+ 
++enum class CaptureEvent { Audio, Start, Stop, Error };
++
+ struct AudioStreamPacket {
+     int sample_rate = 0;
+     int frame_duration = 0;
+     uint32_t timestamp = 0;
+     uint32_t playback_id = 0;
+     uint32_t media_position_ms = 0;
++    uint32_t capture_generation = 0;
++    CaptureEvent capture_event = CaptureEvent::Audio;
+     std::vector<uint8_t> payload;
+ };
+ 
+@@ -64,6 +68,7 @@ public:
+     virtual void SendWakeWordDetected(const std::string& wake_word);
+     virtual void SendStartListening(ListeningMode mode);
+     virtual void SendStopListening();
++    bool SendContinuous(const char* type, const char* state, uint64_t epoch, uint64_t utterance);
+     virtual void SendAbortSpeaking(AbortReason reason);
+     virtual void SendMcpMessage(const std::string& message);
+ 
+diff --git a/main/protocols/websocket_protocol.cc b/main/protocols/websocket_protocol.cc
+index a565869..6ef8b0b 100644
+--- a/main/protocols/websocket_protocol.cc
++++ b/main/protocols/websocket_protocol.cc
+@@ -1,6 +1,10 @@
+ #include "websocket_protocol.h"
+ #include "application.h"
+ #include "board.h"
++#if CONFIG_BOARD_TYPE_AI_CHATBOT_S3
++#include "boards/ai-chatbot-s3/server_url.h"
++#include "boards/ai-chatbot-s3/device_token.h"
++#endif
+ #include "settings.h"
+ #include "system_info.h"
+ 
+@@ -12,6 +16,13 @@
+ 
+ #define TAG "WS"
+ 
++namespace {
++constexpr size_t kMaxJsonBytes = 8192;
++constexpr size_t kMaxAudioBytes = 8192;
++constexpr size_t kMaxSessionIdBytes = 128;
++constexpr size_t kMaxTransportBytes = 16;
++}
++
+ WebsocketProtocol::WebsocketProtocol() { event_group_handle_ = xEventGroupCreate(); }
+ 
+ WebsocketProtocol::~WebsocketProtocol() { vEventGroupDelete(event_group_handle_); }
+@@ -22,7 +33,8 @@ bool WebsocketProtocol::Start() {
+ }
+ 
+ bool WebsocketProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
+-    if (websocket_ == nullptr || !websocket_->IsConnected()) {
++    if (!packet || packet->payload.empty() || packet->payload.size() > kMaxAudioBytes ||
++        websocket_ == nullptr || !websocket_->IsConnected()) {
+         return false;
+     }
+ 
+@@ -73,19 +85,36 @@ bool WebsocketProtocol::IsAudioChannelOpened() const {
+ 
+ void WebsocketProtocol::CloseAudioChannel(bool send_goodbye) {
+     (void)send_goodbye;  // Websocket doesn't need to send goodbye message
++    ++channel_generation_;
+     websocket_.reset();
+ }
+ 
+ bool WebsocketProtocol::OpenAudioChannel() {
+     Settings settings("websocket", false);
+     std::string url = settings.GetString("url");
++#if CONFIG_BOARD_TYPE_AI_CHATBOT_S3
++    url = ServerUrl::GetWebSocketUrl();
++#endif
++#if CONFIG_BOARD_TYPE_AI_CHATBOT_S3
++    std::string token = DeviceToken::Get();
++    if (token.empty()) return false;
++#else
+     std::string token = settings.GetString("token");
++#endif
+     int version = settings.GetInt("version");
+     if (version != 0) {
+         version_ = version;
+     }
+ 
+     error_occurred_ = false;
++    xEventGroupClearBits(event_group_handle_, WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT);
++    session_id_.clear();
++#if CONFIG_BOARD_TYPE_AI_CHATBOT_S3
++    if (url.empty()) {
++        SetError(Lang::Strings::SERVER_NOT_CONNECTED);
++        return false;
++    }
++#endif
+ 
+     auto network = Board::GetInstance().GetNetwork();
+     websocket_ = network->CreateWebSocket(1);
+@@ -105,44 +134,50 @@ bool WebsocketProtocol::OpenAudioChannel() {
+     websocket_->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
+     websocket_->SetHeader("Client-Id", Board::GetInstance().GetUuid().c_str());
+ 
+-    websocket_->OnData([this](const char* data, size_t len, bool binary) {
++    const uint32_t channel_generation = ++channel_generation_;
++    websocket_->OnData([this, channel_generation](const char* data, size_t len, bool binary) {
++        if (channel_generation != channel_generation_) return;
++        if (!data || len == 0) return;
+         if (binary) {
+             if (on_incoming_audio_ != nullptr) {
++                size_t offset = 0, payload_size = len;
++                uint32_t timestamp = 0;
+                 if (version_ == 2) {
+-                    BinaryProtocol2* bp2 = (BinaryProtocol2*)data;
+-                    bp2->version = ntohs(bp2->version);
+-                    bp2->type = ntohs(bp2->type);
+-                    bp2->timestamp = ntohl(bp2->timestamp);
+-                    bp2->payload_size = ntohl(bp2->payload_size);
+-                    auto payload = (uint8_t*)bp2->payload;
+-                    on_incoming_audio_(std::make_unique<AudioStreamPacket>(AudioStreamPacket{
+-                        .sample_rate = server_sample_rate_,
+-                        .frame_duration = server_frame_duration_,
+-                        .timestamp = bp2->timestamp,
+-                        .payload = std::vector<uint8_t>(payload, payload + bp2->payload_size)}));
++                    if (len < sizeof(BinaryProtocol2)) return;
++                    BinaryProtocol2 header;
++                    memcpy(&header, data, sizeof(header));
++                    if (ntohs(header.version) != 2 || ntohs(header.type) != 0) return;
++                    payload_size = ntohl(header.payload_size);
++                    if (payload_size != len - sizeof(BinaryProtocol2)) return;
++                    timestamp = ntohl(header.timestamp);
++                    offset = sizeof(BinaryProtocol2);
+                 } else if (version_ == 3) {
+-                    BinaryProtocol3* bp3 = (BinaryProtocol3*)data;
+-                    bp3->type = bp3->type;
+-                    bp3->payload_size = ntohs(bp3->payload_size);
+-                    auto payload = (uint8_t*)bp3->payload;
+-                    on_incoming_audio_(std::make_unique<AudioStreamPacket>(AudioStreamPacket{
+-                        .sample_rate = server_sample_rate_,
+-                        .frame_duration = server_frame_duration_,
+-                        .timestamp = 0,
+-                        .payload = std::vector<uint8_t>(payload, payload + bp3->payload_size)}));
+-                } else {
+-                    on_incoming_audio_(std::make_unique<AudioStreamPacket>(AudioStreamPacket{
+-                        .sample_rate = server_sample_rate_,
+-                        .frame_duration = server_frame_duration_,
+-                        .timestamp = 0,
+-                        .payload = std::vector<uint8_t>((uint8_t*)data, (uint8_t*)data + len)}));
++                    if (len < sizeof(BinaryProtocol3)) return;
++                    BinaryProtocol3 header;
++                    memcpy(&header, data, sizeof(header));
++                    if (header.type != 0) return;
++                    payload_size = ntohs(header.payload_size);
++                    if (payload_size != len - sizeof(BinaryProtocol3)) return;
++                    offset = sizeof(BinaryProtocol3);
+                 }
++                if (len > kMaxAudioBytes + offset || payload_size == 0 || payload_size > kMaxAudioBytes) return;
++                const auto* payload = reinterpret_cast<const uint8_t*>(data + offset);
++                on_incoming_audio_(std::make_unique<AudioStreamPacket>(AudioStreamPacket{
++                    .sample_rate = server_sample_rate_,
++                    .frame_duration = server_frame_duration_,
++                    .timestamp = timestamp,
++                    .payload = std::vector<uint8_t>(payload, payload + payload_size)}));
+             }
+         } else {
+             // Parse JSON data
++            if (len > kMaxJsonBytes) return;
+             auto root = cJSON_ParseWithLength(data, len);
++            if (!root || !cJSON_IsObject(root)) {
++                cJSON_Delete(root);
++                return;
++            }
+             auto type = cJSON_GetObjectItem(root, "type");
+-            if (cJSON_IsString(type)) {
++            if (cJSON_IsString(type) && type->valuestring) {
+                 if (strcmp(type->valuestring, "hello") == 0) {
+                     ParseServerHello(root);
+                 } else {
+@@ -151,7 +186,7 @@ bool WebsocketProtocol::OpenAudioChannel() {
+                     }
+                 }
+             } else {
+-                ESP_LOGE(TAG, "Missing message type, data: %s", std::string(data, len).c_str());
++                ESP_LOGE(TAG, "Missing message type");
+             }
+             cJSON_Delete(root);
+         }
+@@ -169,7 +204,8 @@ bool WebsocketProtocol::OpenAudioChannel() {
+         });
+     });
+ 
+-    websocket_->OnDisconnected([this]() {
++    websocket_->OnDisconnected([this, channel_generation]() {
++        if (channel_generation != channel_generation_) return;
+         ESP_LOGI(TAG, "Websocket disconnected");
+         if (on_audio_channel_closed_ != nullptr) {
+             on_audio_channel_closed_();
+@@ -186,7 +222,7 @@ bool WebsocketProtocol::OpenAudioChannel() {
+ 
+     // Send hello message to describe the client
+     auto message = GetHelloMessage();
+-    if (!SendText(message)) {
++    if (message.empty() || !SendText(message)) {
+         return false;
+     }
+ 
+@@ -210,6 +246,7 @@ bool WebsocketProtocol::OpenAudioChannel() {
+ std::string WebsocketProtocol::GetHelloMessage() {
+     // keys: message type, version, audio_params (format, sample_rate, channels)
+     cJSON* root = cJSON_CreateObject();
++    if (!root) return {};
+     cJSON_AddStringToObject(root, "type", "hello");
+     cJSON_AddNumberToObject(root, "version", version_);
+     cJSON* features = cJSON_CreateObject();
+@@ -227,6 +264,10 @@ std::string WebsocketProtocol::GetHelloMessage() {
+     cJSON_AddNumberToObject(audio_params, "frame_duration", OPUS_FRAME_DURATION_MS);
+     cJSON_AddItemToObject(root, "audio_params", audio_params);
+     auto json_str = cJSON_PrintUnformatted(root);
++    if (!json_str) {
++        cJSON_Delete(root);
++        return {};
++    }
+     std::string message(json_str);
+     cJSON_free(json_str);
+     cJSON_Delete(root);
+@@ -234,33 +275,38 @@ std::string WebsocketProtocol::GetHelloMessage() {
+ }
+ 
+ void WebsocketProtocol::ParseServerHello(const cJSON* root) {
++    if (!root || !cJSON_IsObject(root)) return;
+     auto transport = cJSON_GetObjectItem(root, "transport");
+-    if (!cJSON_IsString(transport)) {
+-        ESP_LOGE(TAG, "Missing or non-string transport in server hello");
+-        return;
+-    }
+-    if (strcmp(transport->valuestring, "websocket") != 0) {
+-        ESP_LOGE(TAG, "Unsupported transport: %s", transport->valuestring);
++    if (!cJSON_IsString(transport) || !transport->valuestring ||
++        strlen(transport->valuestring) > kMaxTransportBytes ||
++        strcmp(transport->valuestring, "websocket") != 0) {
++        ESP_LOGE(TAG, "Invalid transport in server hello");
+         return;
+     }
+ 
+     auto session_id = cJSON_GetObjectItem(root, "session_id");
+-    if (cJSON_IsString(session_id)) {
+-        session_id_ = session_id->valuestring;
+-        ESP_LOGI(TAG, "Session ID: %s", session_id_.c_str());
++    if (!cJSON_IsString(session_id) || !session_id->valuestring ||
++        strlen(session_id->valuestring) > kMaxSessionIdBytes) {
++        ESP_LOGE(TAG, "Invalid session ID in server hello");
++        return;
+     }
+ 
+     auto audio_params = cJSON_GetObjectItem(root, "audio_params");
+-    if (cJSON_IsObject(audio_params)) {
+-        auto sample_rate = cJSON_GetObjectItem(audio_params, "sample_rate");
+-        if (cJSON_IsNumber(sample_rate)) {
+-            server_sample_rate_ = sample_rate->valueint;
+-        }
+-        auto frame_duration = cJSON_GetObjectItem(audio_params, "frame_duration");
+-        if (cJSON_IsNumber(frame_duration)) {
+-            server_frame_duration_ = frame_duration->valueint;
+-        }
++    if (!cJSON_IsObject(audio_params)) return;
++    auto sample_rate = cJSON_GetObjectItem(audio_params, "sample_rate");
++    auto frame_duration = cJSON_GetObjectItem(audio_params, "frame_duration");
++    auto channels = cJSON_GetObjectItem(audio_params, "channels");
++    auto format = cJSON_GetObjectItem(audio_params, "format");
++    if (!cJSON_IsString(format) || !format->valuestring || strcmp(format->valuestring, "opus") != 0) return;
++    if (!cJSON_IsNumber(sample_rate) || !cJSON_IsNumber(frame_duration) || !cJSON_IsNumber(channels) ||
++        sample_rate->valuedouble != 24000 || frame_duration->valuedouble != 60 || channels->valuedouble != 1) {
++        ESP_LOGE(TAG, "Invalid audio parameters in server hello");
++        return;
+     }
+ 
++    session_id_ = session_id->valuestring;
++    server_sample_rate_ = sample_rate->valueint;
++    server_frame_duration_ = frame_duration->valueint;
++    ESP_LOGI(TAG, "Server hello accepted");
+     xEventGroupSetBits(event_group_handle_, WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT);
+ }
+diff --git a/main/protocols/websocket_protocol.h b/main/protocols/websocket_protocol.h
+index 07acef8..0ba379a 100644
+--- a/main/protocols/websocket_protocol.h
++++ b/main/protocols/websocket_protocol.h
+@@ -5,6 +5,7 @@
+ #include "protocol.h"
+ 
+ #include <web_socket.h>
++#include <atomic>
+ #include <freertos/FreeRTOS.h>
+ #include <freertos/event_groups.h>
+ 
+@@ -25,6 +26,7 @@ private:
+     EventGroupHandle_t event_group_handle_;
+     std::shared_ptr<WebSocket> websocket_;
+     int version_ = 1;
++    std::atomic<uint32_t> channel_generation_{0};
+ 
+     void ParseServerHello(const cJSON* root);
+     bool SendText(const std::string& text) override;

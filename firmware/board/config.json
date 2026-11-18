@@ -1,0 +1,14 @@
+{
+  "target": "esp32s3",
+  "builds": [
+    {
+      "name": "ai-chatbot-s3",
+      "sdkconfig_append": [
+        "CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y",
+        "CONFIG_SPIRAM_MODE_OCT=y",
+        "CONFIG_LANGUAGE_VI_VN=y",
+        "CONFIG_WAKE_WORD_DISABLED=y"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+data/
+local_tokens.json
+*.db
+*.sqlite
+*.sqlite3
+.venv/
+.test/
+__pycache__/
+*.py[cod]
+firmware/
+.git/
+.vscode/
+playwright-report/

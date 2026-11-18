@@ -1,0 +1,71 @@
+# Chỉ theo dõi mã chạy, cấu hình mẫu, tài nguyên và giấy phép.
+# File mới ngoài danh sách phải được kiểm tra trước khi thêm.
+*
+
+!/.gitignore
+!/.dockerignore
+!/.env.example
+!/requirements.txt
+!/Dockerfile
+!/docker-compose.yml
+!/setup.cmd
+!/start.cmd
+
+# Server và công cụ cấu hình thiết bị
+!/ai_providers.py
+!/audio_utils.py
+!/auth.py
+!/calendar_store.py
+!/configure_device.py
+!/gemini_agent.py
+!/google_oauth.py
+!/music.py
+!/pg_user_store.py
+!/preferences.py
+!/server.py
+!/speech_vad.py
+!/storage_backend.py
+!/supabase_calendar_store.py
+!/user_store.py
+!/voice.py
+
+# Giao diện và tài nguyên cần chạy
+!/static/
+!/static/*.html
+!/static/*.css
+!/static/*.js
+!/static/fonts/
+!/static/fonts/*.ttf
+!/static/fonts/INTER-OFL.txt
+
+# Cấu trúc cơ sở dữ liệu, model và giấy phép
+!/migrations/
+!/migrations/*.sql
+!/models/
+!/models/*.onnx
+!/models/LICENSE.silero-vad
+
+# Mã firmware và công cụ build có thể tái tạo
+!/firmware/
+!/firmware/.gitignore
+!/firmware/build.py
+!/firmware/build_guard.py
+!/firmware/pio_assets.py
+!/firmware/pio_prepare.py
+!/firmware/prepare.py
+!/firmware/platformio.ini
+!/firmware/sdkconfig.defaults
+!/firmware/xiaozhi.patch
+!/firmware/board/
+!/firmware/board/ai_chatbot_s3.cc
+!/firmware/board/config.h
+!/firmware/board/config.json
+!/firmware/board/continuous_application.inc
+!/firmware/board/continuous_conversation.h
+!/firmware/board/continuous_vad.h
+!/firmware/board/device_token.h
+!/firmware/board/reminder_client.cc
+!/firmware/board/reminder_client.h
+!/firmware/board/server_url.h
+!/firmware/board/assets/
+!/firmware/board/assets/mahiru.gif

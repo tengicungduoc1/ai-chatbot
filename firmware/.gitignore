@@ -1,0 +1,5 @@
+/upstream/
+/generated/
+/.pio/
+__pycache__/
+*.pyc

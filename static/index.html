@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#111114">
+  <title>Lịch của bạn · Trợ lý AI</title>
+  <script src="/static/theme.js"></script>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/theme-overrides.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Đến nội dung chính</a>
+  <header class="site-header">
+    <a class="brand" href="#main" aria-label="Lịch của bạn, trang chính"><span class="brand-mark" aria-hidden="true">L</span><span>Lịch của bạn</span></a>
+    <div class="header-date"><strong id="today-label">Đang tải ngày hiện tại…</strong><time id="clock-label" aria-label="Giờ Việt Nam">--:--</time></div>
+    <div class="header-actions"><span id="ai-status" class="status-pill">Đang kiểm tra AI</span><div class="device-menu"><button id="device-status" class="status-pill" type="button" aria-expanded="false" aria-controls="device-popover">Đang kiểm tra thiết bị</button><div id="device-popover" class="device-popover" hidden><strong>Thiết bị</strong><ul id="device-popover-list" class="device-list"><li>Đang kiểm tra kết nối…</li></ul><div class="sync-line"><span id="popover-sync">Chưa đồng bộ</span><button id="popover-refresh" class="text-button" type="button">Làm mới</button></div><button id="popover-add-device" class="button subtle popover-add" type="button">Đăng ký thiết bị</button></div></div><button id="theme-toggle" class="theme-toggle" type="button" aria-label="Chuyển sang giao diện sáng">Giao diện sáng</button><button id="open-settings" class="button subtle header-settings" type="button" aria-haspopup="dialog" aria-controls="preferences-dialog">Tùy chỉnh</button><div class="account-menu" id="account-menu"><button id="account-trigger" class="button subtle" type="button" aria-expanded="false" aria-controls="account-popover">Tài khoản <span aria-hidden="true">⌄</span></button><div id="account-popover" class="account-popover" hidden><strong>Tài khoản của bạn</strong><span id="account-identity" class="account-identity"></span><button id="account-settings" class="button subtle mobile-settings" type="button">Tùy chỉnh trợ lý</button><button id="logout" class="button subtle" type="button">Đăng xuất</button></div></div></div>
+  </header>
+  <main id="main" class="page-shell">
+
+    <div id="connection-error" class="notice error" role="alert" hidden></div>
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+    <div class="workspace">
+      <div class="main-column">
+        <section id="calendar" class="panel calendar-panel" aria-labelledby="calendar-title">
+          <div class="calendar-top"><div><p class="eyebrow">LỊCH TRÌNH</p><h2 id="calendar-title">Tuần của bạn</h2></div><button id="add-event" class="button primary" type="button"><span aria-hidden="true">＋</span> Thêm lịch</button></div>
+          <div class="calendar-toolbar">
+            <div class="week-nav"><button id="previous-week" class="icon-button" type="button" aria-label="Tuần trước">‹</button><button id="current-week" class="button subtle" type="button">Hôm nay</button><button id="next-week" class="icon-button" type="button" aria-label="Tuần sau">›</button></div>
+            <strong id="week-label" aria-live="polite">Đang tải tuần…</strong>
+            <nav class="period-toolbar" aria-label="Chuyển nhanh đến thời điểm trong ngày">
+            <button id="period-jump-00" class="period-jump" type="button" aria-label="Cả ngày, 00:00">Cả ngày</button>
+            <button id="period-jump-06" class="period-jump" type="button" aria-label="Sáng, 06:00">Sáng</button>
+            <button id="period-jump-12" class="period-jump" type="button" aria-label="Chiều, 12:00">Chiều</button>
+            <button id="period-jump-18" class="period-jump" type="button" aria-label="Tối, 18:00">Tối</button>
+            </nav>
+            <button id="copy-week" class="button subtle" type="button">Sao chép tuần</button>
+          </div>
+          <p id="calendar-summary" class="sr-only" aria-live="polite">Đang tải lịch từ máy chủ…</p>
+          <section class="day-agenda-panel legacy-day-agenda" aria-labelledby="day-agenda-title">
+            <div class="day-agenda-heading"><div><h3 id="day-agenda-title">Lịch trong ngày</h3><p id="selected-day-label" class="muted">Đang tải ngày…</p></div><div class="day-stepper"><button id="previous-day" class="icon-button" type="button" aria-label="Ngày trước">‹</button><button id="next-day" class="icon-button" type="button" aria-label="Ngày tiếp theo">›</button></div></div>
+            <nav id="day-navigation" class="day-navigation" aria-label="Chọn ngày trong tuần"></nav>
+            <div id="day-agenda" class="day-agenda-list" aria-live="polite" aria-busy="true"><p class="state-message">Đang tải lịch trong ngày…</p></div>
+          </section>
+          <div id="calendar-empty" class="empty-calendar" hidden><div><strong>Tuần này đang rộng mở.</strong><p>Thêm lịch đầu tiên. Mỗi việc có một khoảng thời gian riêng.</p></div><button id="add-first-event" class="button subtle" type="button">＋ Tạo lịch đầu tiên</button></div>
+          <div id="calendar-scroll" class="calendar-scroll" tabindex="0" role="region" aria-label="Lịch tuần theo giờ, cuộn ngang để xem đủ bảy ngày" aria-describedby="calendar-hint"><div id="week-grid" class="week-grid"></div></div>
+          <div class="calendar-footer"><span><i class="legend-dot" aria-hidden="true"></i> Lịch đã lưu</span><span id="calendar-hint">Chọn lịch để chỉnh sửa · Vuốt ngang để xem cả tuần</span></div>
+        </section>
+      </div>
+      <aside class="side-column" aria-label="Tổng quan lịch và thiết bị">
+        <section class="panel agenda-panel" aria-labelledby="today-title"><div class="panel-heading"><h2 id="today-title">Hôm nay</h2><span class="section-tag">TRONG NGÀY</span></div><div id="today-list" class="agenda-list"><p class="muted">Đang tải lịch…</p></div></section>
+        <section class="panel agenda-panel" aria-labelledby="upcoming-title"><div class="panel-heading"><h2 id="upcoming-title">Sắp tới</h2></div><div id="upcoming-list" class="agenda-list"><p class="muted">Đang tải lịch…</p></div></section>
+        <section class="panel reminders-panel" aria-labelledby="reminders-title"><div class="panel-heading"><h2 id="reminders-title">Nhắc lịch</h2><span class="small muted">Trên thiết bị</span></div><div id="reminder-list" class="reminder-list"><p class="muted">Đang tải trạng thái…</p></div><p class="panel-note">Chỉ hiển thị “Đã phát” khi thiết bị xác nhận phát xong.</p></section>
+        <section class="device-card" aria-labelledby="devices-title"><div class="device-card-heading"><h2 id="devices-title">Thiết bị</h2><button id="add-device" class="text-button" type="button">Đăng ký thiết bị</button></div><ul id="device-list" class="device-list"><li>Đang kiểm tra kết nối…</li></ul><div class="sync-line"><span id="sync-status">Chưa đồng bộ</span><button id="refresh" class="text-button" type="button">Làm mới</button></div></section>
+        <section id="assistant" class="panel chat-panel" aria-labelledby="chat-title">
+          <div class="panel-heading"><div class="assistant-heading"><span class="assistant-mark" aria-hidden="true">AI</span><div><h2 id="chat-title">Trò chuyện</h2><p class="muted">Lịch chỉ đổi khi bạn xác nhận.</p></div></div><span id="model-label" class="small muted">Gemini</span></div>
+          <div id="ai-help" class="notice" hidden>AI chưa được cấu hình. Thêm <code>GEMINI_API_KEY</code> vào tệp <code>.env</code> trên máy chủ rồi khởi động lại. Bạn vẫn có thể quản lý lịch thủ công.</div>
+          <div id="chat-log" class="chat-log" role="log" aria-label="Cuộc trò chuyện với trợ lý" aria-live="polite" aria-relevant="additions text" tabindex="0"><div id="chat-welcome" class="chat-welcome"><strong>Bắt đầu bằng một câu hỏi.</strong><p>Trợ lý sẽ xin xác nhận trước khi thay đổi lịch.</p><button id="ask-today" class="suggestion" type="button">Hôm nay tôi có lịch gì? <span aria-hidden="true">↗</span></button></div></div>
+          <div id="chat-confirmation" class="confirmation" hidden><strong>Xác nhận thay đổi lịch</strong><p id="chat-proposal"></p><div class="action-row"><button id="chat-confirm" class="button primary" type="button">Xác nhận thay đổi</button><button id="chat-cancel" class="button subtle" type="button">Hủy đề xuất</button></div></div>
+          <p id="chat-error" class="field-error" role="alert" hidden></p>
+          <form id="chat-form" class="chat-form"><label class="sr-only" for="chat-input">Tin nhắn cho trợ lý</label><textarea id="chat-input" rows="2" maxlength="4000" placeholder="Bạn muốn sắp xếp điều gì?" required></textarea><button id="chat-send" class="button primary" type="submit" aria-label="Gửi tin nhắn">Gửi <span aria-hidden="true">↗</span></button></form>
+          <div class="chat-footnote"><span id="chat-state" role="status">Lịch chỉ thay đổi sau khi bạn xác nhận.</span><span>Shift + Enter để xuống dòng</span></div>
+        </section>
+      </aside>
+    </div>
+  </main>
+  <dialog id="device-register-dialog" aria-labelledby="device-register-title"><div class="preferences-dialog-heading"><div><h2 id="device-register-title">Đăng ký thiết bị</h2><p class="muted">Ghép thiết bị với tài khoản của bạn.</p></div><button id="device-register-close" class="icon-button" type="button" aria-label="Đóng đăng ký thiết bị">×</button></div><form id="device-register-form" class="device-register-form"><label for="device-register-id">Mã thiết bị</label><input id="device-register-id" name="device_id" maxlength="80" autocomplete="off" required aria-describedby="device-id-hint"><p id="device-id-hint" class="field-hint">Nhập Device-Id hiển thị trên thiết bị.</p><label for="device-register-name">Tên dễ nhớ</label><input id="device-register-name" name="name" maxlength="80" autocomplete="off" required placeholder="Ví dụ: Trợ lý bàn học"><p id="device-error" class="field-error" role="alert" hidden></p><div class="dialog-actions"><span></span><button id="device-register-submit" class="button primary" type="submit">Tạo mã kết nối</button></div></form><div id="device-result" class="device-result" hidden><strong>Mã kết nối chỉ hiển thị lần này</strong><p>Sao chép và dán vào trang cấu hình Wi-Fi của thiết bị. Không chia sẻ mã này.</p><div class="device-secret-row"><code id="device-token"></code><button id="device-copy-token" class="button subtle" type="button">Sao chép</button></div><p id="device-copy-status" class="field-hint" role="status"></p></div></dialog>
+  <dialog id="preferences-dialog" aria-labelledby="preferences-title"><div class="preferences-dialog-heading"><div><h2 id="preferences-title">Tùy chỉnh</h2><p class="muted">Tên, phản hồi và giọng đọc.</p></div><button id="preferences-close" class="icon-button" type="button" aria-label="Đóng tùy chỉnh">×</button></div><form id="preferences-form" class="preferences-form">
+    <label for="assistant-name">Tên trợ lý</label><input id="assistant-name" name="assistant_name" maxlength="60" autocomplete="off" required aria-describedby="assistant-name-hint"><p id="assistant-name-hint" class="field-hint">Tên hiển thị trong cuộc trò chuyện.</p>
+    <label for="style-prompt">Cách trợ lý trả lời</label><textarea id="style-prompt" name="style_prompt" rows="3" maxlength="2000" placeholder="Ví dụ: Trả lời ngắn gọn, có ví dụ khi cần."></textarea>
+    <div class="form-columns"><div><label for="preference-model">Mô hình</label><select id="preference-model" name="model" required></select></div><div><label for="preference-voice">Giọng đọc</label><select id="preference-voice" name="voice" required></select></div></div>
+    <p id="preference-status" class="preference-status" role="status" aria-live="polite">Đang tải tùy chỉnh…</p><p id="preference-error" class="field-error" role="alert" hidden></p>
+    <div class="preferences-actions"><span></span><button id="save-preferences" class="button primary" type="submit">Lưu tùy chỉnh</button></div>
+  </form></dialog>
+  <dialog id="event-dialog" aria-labelledby="event-dialog-title" aria-describedby="event-dialog-hint">
+    <form id="event-form"><div class="dialog-heading"><div><p class="eyebrow">LỊCH TRÌNH CỦA BẠN</p><h2 id="event-dialog-title">Thêm lịch mới</h2></div><button class="icon-button" type="button" data-close="event-dialog" aria-label="Đóng cửa sổ lịch">×</button></div>
+      <p id="event-dialog-hint" class="muted">Một khoảng thời gian, một việc cần làm. Không hỗ trợ lịch qua đêm.</p>
+      <label for="event-title">Tên lịch <span class="required">*</span></label><input id="event-title" name="title" maxlength="120" placeholder="Ví dụ: Học tiếng Anh" required autocomplete="off">
+      <label for="event-date">Ngày <span class="required">*</span></label><input id="event-date" name="date" type="date" min="0001-01-01" max="9999-12-31" required>
+      <div class="form-columns"><div><label for="event-start">Bắt đầu <span class="required">*</span></label><input id="event-start" name="start" type="time" step="60" required></div><div><label for="event-end">Kết thúc <span class="required">*</span></label><input id="event-end" name="end" type="time" step="60" required></div></div>
+      <label for="event-note">Ghi chú <span class="optional">không bắt buộc</span></label><textarea id="event-note" name="note" rows="3" maxlength="2000" placeholder="Địa điểm, tài liệu hoặc điều cần chuẩn bị…"></textarea>
+      <label for="event-reminder">Nhắc trước (phút)</label><input id="event-reminder" name="remind_minutes" type="number" min="0" max="1440" step="1" value="10" required aria-describedby="reminder-hint"><p id="reminder-hint" class="field-hint">0 = nhắc đúng giờ · Tối đa 1 ngày (1440 phút).</p>
+      <p id="event-error" class="field-error" role="alert" hidden></p><p id="event-conflict" class="event-conflict" role="status" aria-live="polite" hidden></p>
+      <div id="delete-confirmation" class="confirmation danger-confirmation" hidden><strong>Xóa lịch này?</strong><p id="delete-summary"></p><p>Không thể hoàn tác. Lịch khác không bị ảnh hưởng.</p><div class="action-row"><button id="confirm-delete" class="button danger" type="button">Xóa lịch vĩnh viễn</button><button id="cancel-delete" class="button subtle" type="button">Giữ lại</button></div></div>
+      <div class="dialog-actions"><button id="delete-event" class="button danger-quiet" type="button" hidden>Xóa lịch</button><div class="action-row"><button id="event-cancel" class="button subtle" type="button" data-close="event-dialog">Hủy</button><button id="save-event" class="button primary" type="submit">Lưu lịch</button></div></div>
+    </form>
+  </dialog>
+  <dialog id="copy-dialog" aria-labelledby="copy-title"><form id="copy-form"><div class="dialog-heading"><div><p class="eyebrow">GIỮ NHỊP CHO TUẦN MỚI</p><h2 id="copy-title">Sao chép lịch tuần</h2></div><button class="icon-button" type="button" data-close="copy-dialog" aria-label="Đóng cửa sổ sao chép">×</button></div><p id="copy-source" class="muted"></p><label for="copy-target">Chọn một ngày trong tuần đích</label><input id="copy-target" type="date" min="0001-01-01" max="9999-12-31" required><p id="copy-target-hint" class="field-hint"></p><div class="notice">Tạo bản sao với ngày mới, giữ nguyên giờ, ghi chú và nhắc lịch. Nếu trùng giờ với lịch ở tuần đích, toàn bộ thao tác bị từ chối. Không xóa hay ghi đè lịch có sẵn.</div><p id="copy-error" class="field-error" role="alert" hidden></p><div class="dialog-actions"><span></span><div class="action-row"><button id="copy-cancel" class="button subtle" type="button" data-close="copy-dialog">Hủy</button><button id="copy-submit" class="button primary" type="submit">Sao chép tuần</button></div></div></form></dialog>
+  <noscript><p class="notice">Hãy bật JavaScript để xem và quản lý lịch.</p></noscript>
+</body>
+</html>

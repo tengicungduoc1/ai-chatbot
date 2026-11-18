@@ -1,0 +1,9 @@
+aiohttp>=3.11,<4
+google-genai>=1.0,<2
+python-dotenv>=1.0,<2
+google-auth>=2,<3
+yt-dlp>=2025.1
+onnxruntime>=1.20,<2
+numpy>=1.26,<3
+# Optional: required only when DB_BACKEND=supabase
+psycopg[binary]>=3.2,<4
